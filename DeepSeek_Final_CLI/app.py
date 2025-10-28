@@ -2,7 +2,7 @@
 ===============================================================================
 Proyecto:    Clasificación vía LLM sobre datos tabulares (modo 100% consola)
 Archivo:     app.py
-Autor:       (tu nombre)
+Autor:       Boris Herrera Flores
 Descripción:
     Ejecuta un pipeline reproducible que:
       1) Carga y valida dos archivos CSV: 'clases' y 'datos' (separador ';').
@@ -11,7 +11,7 @@ Descripción:
       3) Genera un prompt con ejemplos etiquetados y casos a clasificar.
       4) Invoca un LLM (DeepSeek vía cliente OpenAI-compatible) a distintas
          temperaturas y parsea las predicciones devueltas.
-      5) Calcula métricas de evaluación (accuracy, kappa, AUC opcional),
+      5) Calcula métricas de evaluación (accuracy, kappa, AUC, curva ROC),
          matriz de confusión, etiquetas y tiempos por fase.
       6) Persiste TODOS los artefactos en un CSV acumulativo (una fila por corrida),
          serializando objetos complejos en JSON (reportes, matrices, tablas, etc.).
@@ -19,30 +19,16 @@ Descripción:
 Requisitos:
     - Python 3.9+
     - Paquetes: pandas, scikit-learn, openai
-    - Variable de entorno: DEEPSEEK_API_KEY (clave para el endpoint DeepSeek)
+    - Variable de entorno: DEEPSEEK_API_KEY
 
 Notas:
     - Los CSV de entrada deben estar separados por ';' y sin cabecera. La primera
       columna de ambos archivos se descarta como supuesto ID externo.
     - Por defecto, el script buscará 'clases' y 'datos' con o sin extensión '.csv'.
     - El archivo de salida es 'Resuldatos.csv' y se ANEXA en corridas sucesivas.
-    - Las columnas JSON incluyen: report_json, conf_matrix_json, labels_json,
-      resultados_json, tiempos_json y ancho_banda_json.
-    - Si Excel/PQ está en configuración regional con coma decimal, se recomienda
-      usar separador ';' al importar el CSV para que los decimales 0.2/0.5/0.8
-      no se trunquen a 2/5/8.
-
-Ejemplos de uso (PowerShell / CMD en Windows):
-    # Tres corridas por cada temperatura por defecto (0.2, 0.5, 0.8)
-    py app.py --clases clases --datos datos --out Resuldatos.csv
-
-    # Temperaturas explícitas y 3 repeticiones por temperatura
-    py app.py --clases clases --datos datos --out Resuldatos.csv --temps 0.2 0.5 0.8 --reps 3
-
-Ejemplos de uso (bash en Linux/macOS):
-    export DEEPSEEK_API_KEY="sk-..."
-    python3 app.py --clases clases --datos datos --out Resuldatos.csv
-    python3 app.py --clases clases --datos datos --out Resuldatos.csv --temps 0.2 0.5 0.8 --reps 3
+    - Columnas JSON: report_json, conf_matrix_json, labels_json,
+      resultados_json, tiempos_json, ancho_banda_json, roc_curve_json.
+    - resultados_json ahora incluye prob_llm (probabilidad prevista de clase=1).
 ===============================================================================
 """
 
@@ -51,12 +37,16 @@ import time
 import uuid
 import json
 import argparse
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 from sklearn.metrics import (
-    classification_report, confusion_matrix, roc_auc_score,
-    accuracy_score, cohen_kappa_score
+    classification_report,
+    confusion_matrix,
+    roc_auc_score,
+    roc_curve,
+    accuracy_score,
+    cohen_kappa_score
 )
 from openai import OpenAI
 
@@ -67,23 +57,8 @@ from openai import OpenAI
 
 def resolve_path(p: str) -> str:
     """
-    Resuelve la ruta de archivo. Si no existe exactamente como se entregó,
+    Resuelve la ruta de archivo. Si no existe como se entregó
     intenta con sufijo '.csv'. Lanza FileNotFoundError si no existe.
-
-    Parámetros
-    ----------
-    p : str
-        Ruta o nombre base del archivo (con o sin '.csv').
-
-    Retorna
-    -------
-    str
-        Ruta existente al archivo.
-
-    Excepciones
-    -----------
-    FileNotFoundError
-        Si no se localiza el archivo ni con ni sin sufijo '.csv'.
     """
     if os.path.isfile(p):
         return p
@@ -95,21 +70,6 @@ def resolve_path(p: str) -> str:
 def require_api_key(env_name: str = "DEEPSEEK_API_KEY") -> str:
     """
     Obtiene la API key requerida desde variable de entorno.
-
-    Parámetros
-    ----------
-    env_name : str
-        Nombre de la variable de entorno a consultar.
-
-    Retorna
-    -------
-    str
-        Valor de la API key.
-
-    Excepciones
-    -----------
-    ValueError
-        Si la variable de entorno no está definida.
     """
     key = os.getenv(env_name)
     if not key:
@@ -124,11 +84,6 @@ def require_api_key(env_name: str = "DEEPSEEK_API_KEY") -> str:
 def get_client() -> OpenAI:
     """
     Construye el cliente OpenAI configurado para DeepSeek (endpoint compatible).
-
-    Retorna
-    -------
-    OpenAI
-        Cliente inicializado con base_url y api_key.
     """
     api_key = require_api_key("DEEPSEEK_API_KEY")
     return OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
@@ -150,18 +105,6 @@ def procesar_archivos(clases_path: str, datos_path: str) -> pd.DataFrame:
       5) Estandariza los nombres de columnas de atributos a d1..dn.
       6) Concatena 'clase' + atributos y genera una muestra reproducible:
          150 primeras + 150 últimas filas (si existen), barajada con semilla fija.
-
-    Parámetros
-    ----------
-    clases_path : str
-        Ruta al CSV con las clases por fila.
-    datos_path : str
-        Ruta al CSV con los atributos por fila.
-
-    Retorna
-    -------
-    pd.DataFrame
-        DataFrame con columna 'clase' seguida por d1..dn.
     """
     df_clases = pd.read_csv(clases_path, header=None, sep=";")
     df_datos = pd.read_csv(datos_path, header=None, sep=";")
@@ -198,61 +141,46 @@ def generate_prompt(X_train: pd.DataFrame, X_test: pd.DataFrame, y_train: pd.Ser
     """
     Construye el prompt con ejemplos etiquetados y casos a clasificar.
 
-    Diseño:
-      - Lista ejemplos de entrenamiento como "idx: f1, f2, ... -> clase".
-      - Solicita clasificar el set de prueba con el formato "idx: clase".
-      - Ese formato facilita un parseo determinista posterior.
-
-    Parámetros
-    ----------
-    X_train : pd.DataFrame
-        Atributos de entrenamiento.
-    X_test : pd.DataFrame
-        Atributos a clasificar.
-    y_train : pd.Series
-        Etiquetas correspondientes al entrenamiento.
-
-    Retorna
-    -------
-    str
-        Prompt listo para enviar al LLM.
+    Nuevo formato de salida requerido al LLM:
+        idx: clase_predicha prob=ppp
+    donde:
+        - clase_predicha es 0 o 1
+        - ppp es la probabilidad (entre 0 y 1) de que la clase verdadera sea 1.
     """
-    prompt = "Estas son muestras del conjunto de entrenamiento con sus clases:\n"
+    prompt = (
+        "Eres un clasificador binario. Devuelves para cada fila dos cosas:\n"
+        "1) La clase predicha (0 o 1).\n"
+        "2) Tu probabilidad estimada de que la fila pertenezca a la clase 1,\n"
+        "   en el rango [0,1] con hasta 3 decimales.\n\n"
+        "Formato EXACTO por línea:\n"
+        "<indice>: <clase_predicha> prob=<probabilidad_de_clase_1>\n\n"
+        "Ejemplo:\n"
+        "12: 1 prob=0.87\n"
+        "13: 0 prob=0.12\n\n"
+        "No expliques nada más. Sólo entrega una línea por índice solicitado.\n\n"
+        "Ahora ve el set de entrenamiento etiquetado:\n"
+    )
+
     for i, row in X_train.iterrows():
         features = ", ".join([str(round(val, 2)) for val in row.values])
         prompt += f"{i}: {features} -> {y_train[i]}\n"
 
-    prompt += "\nClasifica las siguientes muestras (solo pon 1 o 0 según similitud):\n"
+    prompt += "\nClasifica las siguientes muestras. Recuerda el formato indicado:\n"
     for i, row in X_test.iterrows():
         features = ", ".join([str(round(val, 2)) for val in row.values])
         prompt += f"{i}: {features}\n"
 
-    prompt += "\nResponde en el formato:\n0: clase\n1: clase\n..."
     return prompt
 
 
 def call_openai(prompt: str, temperature: float, client: OpenAI) -> str:
     """
     Invoca el modelo con la temperatura indicada y devuelve el texto de la primera elección.
-
-    Parámetros
-    ----------
-    prompt : str
-        Instrucción generada.
-    temperature : float
-        Temperatura de muestreo del LLM.
-    client : OpenAI
-        Cliente ya inicializado.
-
-    Retorna
-    -------
-    str
-        Respuesta textual del LLM (única mejor elección).
     """
     response = client.chat.completions.create(
         model="deepseek-chat",
         messages=[
-            {"role": "system", "content": "Eres un clasificador de datos tabulares."},
+            {"role": "system", "content": "Eres un clasificador de datos tabulares binario estricto."},
             {"role": "user", "content": prompt}
         ],
         temperature=temperature
@@ -260,33 +188,55 @@ def call_openai(prompt: str, temperature: float, client: OpenAI) -> str:
     return response.choices[0].message.content
 
 
-def parse_predictions(response: str) -> Dict[int, str]:
+def parse_predictions(response: str) -> Dict[int, Tuple[str, Optional[float]]]:
     """
-    Parsea líneas con el patrón 'indice: etiqueta' a un diccionario índice->etiqueta.
+    Parsea líneas con el patrón:
+        indice: etiqueta prob=probabilidad
 
-    Comportamiento:
-      - Ignora líneas sin ':' o con índices no enteros.
-      - Normaliza la etiqueta (minúsculas y sin espacios exteriores).
+    Devuelve dict:
+        idx -> (etiqueta_predicha:str, prob_positiva:float)
 
-    Parámetros
-    ----------
-    response : str
-        Respuesta del LLM en texto plano.
+    Si no encuentra probabilidad válida asigna None.
+    Si no encuentra etiqueta válida asigna 'no_detectado'.
 
-    Retorna
-    -------
-    Dict[int, str]
-        Mapa de índice a etiqueta predicha.
+    Ejemplo de línea válida:
+        7: 1 prob=0.82
     """
-    preds: Dict[int, str] = {}
-    for line in response.strip().splitlines():
-        if ':' in line:
-            key, val = line.split(':', 1)
-            try:
-                idx = int(key.strip())
-                preds[idx] = val.strip().lower()
-            except ValueError:
-                continue
+    preds: Dict[int, Tuple[str, Optional[float]]] = {}
+    for raw_line in response.strip().splitlines():
+        line = raw_line.strip()
+        if ":" not in line:
+            continue
+
+        # split por "idx:" (primera aparición)
+        left, right = line.split(":", 1)
+        try:
+            idx = int(left.strip())
+        except ValueError:
+            continue
+
+        etiqueta_pred = "no_detectado"
+        prob_val: Optional[float] = None
+
+        # ejemplo right = "1 prob=0.82"
+        parts = right.strip().split()
+        # buscar primero número 0/1 como clase
+        if len(parts) > 0:
+            cand = parts[0].strip().lower()
+            if cand in ["0", "1"]:
+                etiqueta_pred = cand
+
+        # buscar token tipo prob=0.82
+        for p in parts[1:]:
+            if p.lower().startswith("prob="):
+                try:
+                    prob_val = float(p.split("=", 1)[1])
+                except ValueError:
+                    prob_val = None
+                break
+
+        preds[idx] = (etiqueta_pred, prob_val)
+
     return preds
 
 
@@ -303,13 +253,6 @@ def evaluar_llm_sobre_archivos(
     """
     Ejecuta el pipeline completo para una temperatura dada y devuelve
     un diccionario con todos los artefactos requeridos para persistencia.
-
-    Retorna
-    -------
-    Dict
-        Estructura serializable con: métricas, matriz de confusión, etiquetas,
-        tiempos por fase, ancho de banda estimado, prompt y respuesta, tamaños
-        de entrenamiento/prueba y conteos de bytes enviados/recibidos.
     """
     start_total = time.time()
 
@@ -350,29 +293,70 @@ def evaluar_llm_sobre_archivos(
     # Fase 4: Evaluación
     start_eval = time.time()
     preds_dict = parse_predictions(response)
-    pred_labels: List[str] = [preds_dict.get(i, 'no_detectado') for i in range(len(X_test))]
+
+    # Construir listas alineadas
+    pred_labels: List[str] = []
+    prob_list: List[Optional[float]] = []
+    for i in range(len(X_test)):
+        etiqueta_i, prob_i = preds_dict.get(i, ("no_detectado", None))
+        pred_labels.append(etiqueta_i)
+        prob_list.append(prob_i)
+
     y_test_list: List[str] = [str(label).strip().lower() for label in y_test]
 
+    # Métricas clásicas basadas en etiquetas duras
     report = classification_report(y_test_list, pred_labels, output_dict=True)
     conf_matrix = confusion_matrix(y_test_list, pred_labels)
     labels = sorted(list(set(y_test_list + pred_labels)))
     accuracy = accuracy_score(y_test_list, pred_labels)
     kappa = cohen_kappa_score(y_test_list, pred_labels)
 
-    # AUC binario opcional: mapeo de clases a {0,1}. Si falla (multiclase/no mapeable), se omite.
+    # Métricas probabilísticas
+    # AUC y curva ROC requieren:
+    #   y_true_bin: 0/1 reales
+    #   y_score: probabilidad estimada de clase=1
+    # Se intentará sólo si las clases parecen binarias.
+    auc: Optional[float] = None
+    roc_points: Optional[Dict[str, List[float]]] = None
     try:
         y_true_bin = [1 if val in ['1', 1, 'true'] else 0 for val in y_test_list]
-        y_pred_bin = [1 if val in ['1', 1, 'true'] else 0 for val in pred_labels]
-        auc: Optional[float] = roc_auc_score(y_true_bin, y_pred_bin)
+
+        # Si el modelo no entregó probabilidad se hace fallback:
+        #   prob=1.0 si predijo clase=1
+        #   prob=0.0 si predijo clase=0
+        #   prob=None -> usar 0.5
+        score_list: List[float] = []
+        for hard_label, p in zip(pred_labels, prob_list):
+            if p is not None:
+                score_list.append(p)
+            else:
+                if hard_label in ['1', 'true', 1]:
+                    score_list.append(1.0)
+                elif hard_label in ['0', 'false', 0]:
+                    score_list.append(0.0)
+                else:
+                    score_list.append(0.5)
+
+        auc = roc_auc_score(y_true_bin, score_list)
+
+        fpr, tpr, thr = roc_curve(y_true_bin, score_list)
+        roc_points = {
+            "fpr": [float(x) for x in fpr],
+            "tpr": [float(x) for x in tpr],
+            "thresholds": [float(x) for x in thr]
+        }
     except Exception:
         auc = None
+        roc_points = None
 
-    # Resultados por muestra (índice, clase real, predicción)
+    # Resultados por muestra
     df_results = pd.DataFrame({
         "indice": range(len(X_test)),
         "clase_real": y_test_list,
-        "prediccion_llm": pred_labels
+        "prediccion_llm": pred_labels,
+        "prob_llm": prob_list
     })
+
     end_eval = time.time()
 
     # Consolidación de tiempos
@@ -394,6 +378,8 @@ def evaluar_llm_sobre_archivos(
         "accuracy": accuracy,
         "kappa": kappa,
         "auc": auc if auc is not None else "",
+        # Guardamos también la curva ROC completa para análisis posterior
+        "roc_curve_json": json.dumps(roc_points, ensure_ascii=False) if roc_points is not None else "",
         "labels_json": json.dumps(labels, ensure_ascii=False),
         "conf_matrix_json": json.dumps(conf_matrix.tolist(), ensure_ascii=False),
         "report_json": json.dumps(report, ensure_ascii=False),
@@ -420,10 +406,8 @@ def append_dict_to_csv(row: Dict, out_csv: str) -> None:
     Anexa una fila (dict) a un CSV acumulativo. Crea el archivo con cabeceras
     si no existe. Por defecto utiliza coma como delimitador.
 
-    Sugerencia:
-      Si Excel/PQ está en configuración regional con coma decimal, conviene
-      importar este CSV declarando el delimitador como ';' o, alternativamente,
-      modificar este método para usar sep=';' y escribir en un archivo distinto.
+    Si Excel/PQ está en configuración regional con coma decimal
+    conviene importar este CSV declarando el delimitador como ';'.
     """
     df = pd.DataFrame([row])
     file_exists = os.path.isfile(out_csv)
@@ -438,10 +422,6 @@ def main():
     """
     Punto de entrada CLI. Lanza N repeticiones por cada temperatura indicada,
     ejecuta el pipeline y anexa los resultados al CSV acumulativo.
-
-    Ejemplos:
-        py app.py --clases clases --datos datos --out Resuldatos.csv
-        py app.py --clases clases --datos datos --out Resuldatos.csv --temps 0.2 0.5 0.8 --reps 3
     """
     parser = argparse.ArgumentParser(
         description="Automatiza corridas LLM y guarda resultados en un CSV acumulativo."
