@@ -5,7 +5,7 @@ Pipeline reproducible que:
 2) Construye una muestra reproducible (150 primeras + 150 últimas filas) y separa entrenamiento/prueba (60/40).
 3) Genera un prompt con ejemplos etiquetados y casos a clasificar.
 4) Invoca un LLM (DeepSeek vía cliente OpenAI-compatible) a distintas temperaturas.
-5) Parsea predicciones y calcula métricas (accuracy, kappa, AUC opcional), matriz de confusión y tiempos por fase.
+5) Parsea predicciones, incluyendo clase y probabilidad asociada, y calcula métricas (accuracy, kappa, AUC, curva ROC), matriz de confusión y tiempos por fase.
 6) Persiste todos los artefactos de cada corrida en un CSV acumulativo (una fila por corrida), serializando objetos complejos en JSON.
 
 ---
@@ -47,14 +47,14 @@ $env:DEEPSEEK_API_KEY="sk-..."
   CSV separado por `;`, sin cabecera. La **primera columna** se descarta (ID/índice externo).  
   Desde la **segunda columna** en adelante: atributos numéricos (`d1..dn`) por fila.
 
-> Ambos archivos deben tener **igual número de filas**.  
-> El script acepta nombres **con o sin** la extensión `.csv` (ej.: `--clases clases` o `--clases clases.csv`).
+Ambos archivos deben tener igual número de filas.  
+El script acepta nombres con o sin la extensión `.csv` (ej.: `--clases clases` o `--clases clases.csv`).
 
 ---
 
 ## Uso rápido
 
-Ejecuta **3 corridas por cada temperatura** por defecto (`0.2`, `0.5`, `0.8`) y **anexa** resultados a `Resuldatos.csv`:
+Ejecuta tres corridas por cada temperatura por defecto (`0.2`, `0.5`, `0.8`) y anexa resultados a `Resuldatos.csv`:
 
 ```powershell
 # Windows
@@ -66,7 +66,7 @@ py app.py --clases clases --datos datos --out Resuldatos.csv
 python3 app.py --clases clases --datos datos --out Resuldatos.csv
 ```
 
-Especifica temperaturas y repeticiones:
+Ejecuta con temperaturas y repeticiones explícitas:
 
 ```powershell
 py app.py --clases clases --datos datos --out Resuldatos.csv --temps 0.2 0.5 0.8 --reps 3
@@ -82,94 +82,100 @@ Parámetros CLI disponibles:
 --reps     Repeticiones por temperatura. Por defecto: 3
 ```
 
-> El archivo `Resuldatos.csv` se crea si no existe y **se va anexando** en corridas sucesivas.  
-> Cada corrida agrega un `run_id` (UUID) y `timestamp` UTC únicos.
+El archivo `Resuldatos.csv` se crea si no existe y se va anexando en corridas sucesivas.  
+Cada corrida agrega un `run_id` (UUID) y `timestamp` UTC únicos.
 
 ---
 
 ## Salida: columnas y formatos
 
-Cada fila del CSV de salida representa **una corrida**. Incluye, entre otras, las columnas:
+Cada fila del CSV de salida representa una corrida. Incluye, entre otras, las columnas:
 
 - `run_id` (UUID de la corrida)  
 - `timestamp` (UTC ISO 8601)  
 - `temperature` (temperatura del LLM)  
-- `approx_tokens` (aproximación simple por división de palabras del prompt)  
-- `accuracy`, `kappa`, `auc` (si aplica)  
+- `approx_tokens` (estimación por división de palabras del prompt)  
+- `accuracy`, `kappa`, `auc`  
 - `n_train`, `n_test`  
 - `bytes_enviados`, `bytes_recibidos`, `bytes_totales`  
-- `prompt`, `response` (texto plano)  
+- `prompt`, `response` (texto plano del modelo)  
 - JSON serializados:
   - `report_json` (salida de `classification_report(output_dict=True)`)  
   - `conf_matrix_json` (matriz de confusión `list[list[int]]`)  
   - `labels_json` (lista de etiquetas ordenadas)  
-  - `resultados_json` (lista de dicts con {indice, clase_real, prediccion_llm})  
+  - `resultados_json` (lista de dicts con {indice, clase_real, prediccion_llm, prob_llm})  
   - `tiempos_json` (duraciones por fase en segundos)  
-  - `ancho_banda_json` (KB enviados/recibidos/total)
+  - `ancho_banda_json` (KB enviados/recibidos/total)  
+  - `roc_curve_json` (estructura con FPR, TPR y thresholds de la curva ROC)
 
-> Sugerencia para Excel/Power Query en es-CL/es-ES: si ves que `0.2/0.5/0.8` aparecen como `2/5/8`, importa el CSV con **delimitador `;`** o cambia el tipo usando **“Usar configuración regional…” → Inglés (Estados Unidos)** para la columna `temperature`.
+Cuando se visualiza en Excel o Power Query con configuración regional que usa coma decimal, se debe importar el CSV declarando el delimitador como `;` para evitar que los decimales se interpreten como enteros.
 
 ---
 
 ## Arquitectura del pipeline
 
 1. **Carga y validación** (`procesar_archivos`)  
-   - Lee `clases.csv` y `datos.csv` (sep `;`, sin cabecera), descarta la primera columna y verifica misma cantidad de filas.  
-   - Estandariza columnas de atributos (`d1..dn`) y concatena con la columna `clase`.  
-   - Genera muestra reproducible: `head(150) + tail(150)` barajadas (semilla `42`).
+   Lee `clases.csv` y `datos.csv` (sep `;`, sin cabecera), descarta la primera columna y verifica que tengan igual número de filas.  
+   Estandariza columnas de atributos (`d1..dn`) y concatena con la columna `clase`.  
+   Genera muestra reproducible: 150 primeras + 150 últimas filas barajadas con semilla `42`.
 
 2. **Partición 60/40**  
-   - `train_df = sample(frac=0.6, random_state=42)`  
-   - `test_df = resto`
+   Separa entrenamiento y prueba de forma reproducible con semilla fija.
 
 3. **Prompting** (`generate_prompt`)  
-   - Lista ejemplos de entrenamiento en formato: `idx: f1, f2, ... -> clase`.  
-   - Pide clasificar el set de prueba en formato estricto: `idx: clase`.
+   Genera un prompt con formato estricto que exige devolver, por cada muestra de prueba, la clase (`0` o `1`) y la probabilidad de clase positiva (`prob=valor`).  
+   Ejemplo:  
+   ```
+   12: 1 prob=0.87
+   13: 0 prob=0.12
+   ```
 
 4. **Inferencia LLM** (`call_openai`)  
-   - Cliente OpenAI compatible, `model="deepseek-chat"`, temperatura variable.  
-   - Devuelve la respuesta textual de la primera elección.
+   Usa cliente OpenAI compatible (`model="deepseek-chat"`) con la temperatura indicada.  
+   Devuelve el texto de la primera respuesta del modelo.
 
 5. **Parseo** (`parse_predictions`)  
-   - Extrae pares `idx: etiqueta` (minúsculas, recorta espacios).  
-   - Si falta un índice, su predicción se marca como `no_detectado`.
+   Extrae el índice, la clase predicha y la probabilidad.  
+   Si no hay probabilidad, se asigna `None`.  
+   Si no hay clase, se asigna `no_detectado`.
 
 6. **Evaluación** (`evaluar_llm_sobre_archivos`)  
-   - `classification_report`, `confusion_matrix`, `accuracy`, `cohen_kappa_score`.  
-   - AUC binario opcional (mapea clases a `{0,1}` si corresponde).  
-   - Mide tiempos por fase y bytes intercambiados (estimados).
+   Calcula métricas `accuracy`, `kappa`, `auc` y genera la curva ROC.  
+   Si el modelo entrega probabilidades válidas, se usan para el AUC; si no, se infieren según la clase.  
+   Guarda reportes, matriz de confusión, etiquetas, tiempos y anchos de banda estimados.  
+   Incluye en el JSON de resultados la probabilidad por muestra (`prob_llm`) y la curva ROC (`roc_curve_json`).
 
 7. **Persistencia** (`append_dict_to_csv`)  
-   - Anexa una fila por corrida a `Resuldatos.csv` (crea cabecera si no existe).
+   Anexa una fila con todos los artefactos al CSV acumulativo de salida.  
+   Crea cabecera si no existe.
 
 ---
 
-## Buenas prácticas y notas
+## Buenas prácticas
 
-- **API key**: no la hardcodees. Usa `DEEPSEEK_API_KEY`.  
-- **Reproducibilidad**: la semilla fija (`random_state=42`) asegura el mismo split y shuffle.  
-- **Privacidad**: `prompt` y `response` pueden contener datos sensibles. Versiona el CSV con criterio.  
-- **Regiones decimales**: si tu sistema usa coma `,` como decimal, considera exportar otro CSV con `sep=';'` o importar explícitamente como `;` en Excel/PQ.  
-- **Extensibilidad**: para más temperaturas o repeticiones, ajusta `--temps` y `--reps`.
+- Configura correctamente la variable de entorno `DEEPSEEK_API_KEY`.  
+- Usa separador `;` al importar el CSV si tu sistema usa coma decimal.  
+- Conserva la semilla `42` para reproducibilidad.  
+- No incluyas datos sensibles en `prompt` ni en `response` si compartes resultados.  
+- Cada corrida produce datos independientes que pueden auditarse por `run_id`.
 
 ---
 
-## Ejecución de ejemplo
-
-Tres repeticiones por cada temperatura por defecto (`0.2`, `0.5`, `0.8`):
+## Ejemplo de ejecución
 
 ```powershell
 py app.py --clases clases --datos datos --out Resuldatos.csv
 ```
 
-Corridas con temperaturas explícitas y 3 repeticiones por temperatura:
+Ejemplo con temperatura única y una repetición:
 
-```powershell
-py app.py --clases clases --datos datos --out Resuldatos.csv --temps 0.2 0.5 0.8 --reps 3
+```bash
+python3 app.py --clases clases --datos datos --out Resuldatos.csv --temps 0.5 --reps 1
 ```
 
 ---
 
 ## Licencia
 
-MIT (ajústala según tus necesidades).
+MIT
+
